@@ -123,6 +123,7 @@ async fn execute_ordinary(state: RuntimeApiState, request: RuntimeOwnerRequest) 
         } => {
             let Json(value) = api(list_threads(
                 State(state),
+                None,
                 Query(ThreadsQuery {
                     limit: Some(limit),
                     include_archived: Some(include_archived),
@@ -188,7 +189,10 @@ async fn execute_ordinary(state: RuntimeApiState, request: RuntimeOwnerRequest) 
         }
         RuntimeOwnerRequest::StartTurn { thread_id, body } => {
             let (_, Json(value)) =
-                api(start_thread_turn(State(state), Path(thread_id), Json(decode(body)?)).await)?;
+                api(
+                    start_thread_turn(State(state), None, Path(thread_id), Json(decode(body)?))
+                        .await,
+                )?;
             serde_json::to_value(value)?
         }
         RuntimeOwnerRequest::DecideApproval {
@@ -393,6 +397,7 @@ async fn execute_native(
             }
             let Json(records) = api(list_threads(
                 State(state.clone()),
+                None,
                 Query(ThreadsQuery {
                     limit: None,
                     include_archived: params.include_archived,
