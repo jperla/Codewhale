@@ -551,6 +551,7 @@ pub enum AppAction {
     NewSession {
         sync: codewhale_command_contract::facets::SessionSyncPayload,
         force: bool,
+        draft: Option<String>,
     },
     SyncSession {
         session_id: Option<String>,
