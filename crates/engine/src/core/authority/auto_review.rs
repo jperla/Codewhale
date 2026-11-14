@@ -2025,35 +2025,129 @@ fn shell_params_are_publish_like(params: &Value) -> bool {
 /// durable-review floor armed now that the floor no longer treats every
 /// non-read-only command as destructive (#3883).
 fn shell_params_are_destructive_like(params: &Value, workspace: Option<&std::path::Path>) -> bool {
+    let Some(command) = shell_command_param(params) else {
+        return false;
+    };
+
+    command_is_destructive_for_spelling(command, workspace, !command.contains('\\'))
+        || (command.contains('\\')
+            && command_is_destructive_for_spelling(
+                &normalize_windows_separators_for_shlex(command),
+                workspace,
+                true,
+            ))
+}
+
+fn command_is_destructive_for_spelling(
+    command: &str,
+    workspace: Option<&std::path::Path>,
+    allow_drive_relative: bool,
+) -> bool {
     use codewhale_execpolicy::command_safety::{
         SafetyLevel, analyze_command, command_invocations, destroyer_floor_invocations,
         is_literal_rm_invocation,
-    };
-    let Some(command) = shell_command_param(params) else {
-        return false;
     };
 
     split_shell_segments_for_review(command)
         .iter()
         .any(|segment| analyze_command(segment).level == SafetyLevel::Dangerous)
-        // Only one literal rm may use paths resolved before execution. Any
-        // earlier command could replace an ancestor (mv and Python can do
-        // that just as ln can), invalidating the workspace clearance.
         || command_invocations(command).is_none_or(|argvs| {
             let workspace = workspace.filter(|_| is_literal_rm_invocation(command));
-            argvs.iter().any(|argv| argv_is_destroyer(argv, workspace))
+            argvs
+                .iter()
+                .any(|argv| argv_is_destroyer(argv, workspace, allow_drive_relative))
         })
         || (!is_literal_rm_invocation(command)
-            && destroyer_floor_invocations(command)
-                .is_none_or(|argvs| argvs.iter().any(|argv| argv_is_destroyer(argv, None))))
+            && destroyer_floor_invocations(command).is_none_or(|argvs| {
+                argvs
+                    .iter()
+                    .any(|argv| argv_is_destroyer(argv, None, allow_drive_relative))
+            }))
 }
 
-fn is_destroyer_rooted_target(target: &str) -> bool {
+fn is_windows_path_segment_char(ch: char) -> bool {
+    !ch.is_whitespace() && !matches!(ch, '"' | '\'' | '\\' | ';' | '&' | '|' | '<' | '>' | '`')
+}
+
+fn normalize_backslash_token(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    out: &mut String,
+) {
+    match chars.peek().copied() {
+        Some('\\') => {
+            chars.next();
+            out.push_str("//");
+        }
+        Some(next) if is_windows_path_segment_char(next) => {
+            chars.next();
+            out.push('/');
+            out.push(next);
+        }
+        Some(next) => {
+            chars.next();
+            out.push('\\');
+            out.push(next);
+        }
+        None => out.push('\\'),
+    }
+}
+
+fn normalize_windows_separators_for_shlex(command: &str) -> String {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum QuoteState {
+        Unquoted,
+        Single,
+        Double,
+    }
+
+    let mut out = String::with_capacity(command.len());
+    let mut chars = command.chars().peekable();
+    let mut state = QuoteState::Unquoted;
+    while let Some(ch) = chars.next() {
+        match state {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    state = QuoteState::Unquoted;
+                }
+                out.push(ch);
+            }
+            QuoteState::Double => match ch {
+                '"' => {
+                    state = QuoteState::Unquoted;
+                    out.push(ch);
+                }
+                '\\' => normalize_backslash_token(&mut chars, &mut out),
+                _ => out.push(ch),
+            },
+            QuoteState::Unquoted => match ch {
+                '\'' => {
+                    state = QuoteState::Single;
+                    out.push(ch);
+                }
+                '"' => {
+                    state = QuoteState::Double;
+                    out.push(ch);
+                }
+                '\\' => normalize_backslash_token(&mut chars, &mut out),
+                _ => out.push(ch),
+            },
+        }
+    }
+    out
+}
+
+fn is_destroyer_absolute_or_drive_target(target: &str, allow_drive_relative: bool) -> bool {
     let bytes = target.as_bytes();
     target.starts_with('/')
-        || target.starts_with("\\\\")
-        || (cfg!(windows) && target.starts_with('\\'))
-        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || target.starts_with('\\')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+        || (allow_drive_relative
+            && bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':')
 }
 
 /// The background/headless floor, which Full Access skips, must hold
@@ -2062,7 +2156,11 @@ fn is_destroyer_rooted_target(target: &str) -> bool {
 /// `dd`/`shred`/`wipefs` onto a device, `mkfs`, and a forced recursive delete
 /// of an absolute path that is not provably inside a safe workspace (#3883
 /// follow-up).
-fn argv_is_destroyer(argv: &[String], workspace: Option<&std::path::Path>) -> bool {
+fn argv_is_destroyer(
+    argv: &[String],
+    workspace: Option<&std::path::Path>,
+    allow_drive_relative: bool,
+) -> bool {
     let Some((command, args)) = argv.split_first() else {
         return false;
     };
@@ -2084,7 +2182,9 @@ fn argv_is_destroyer(argv: &[String], workspace: Option<&std::path::Path>) -> bo
                         recursive |= flag.contains(['r', 'R']);
                         force |= flag.contains('f');
                     }
-                    target if is_destroyer_rooted_target(target) => {
+                    target
+                        if is_destroyer_absolute_or_drive_target(target, allow_drive_relative) =>
+                    {
                         outside_target |= !strictly_inside(workspace, target);
                     }
                     _ => {}
@@ -7072,155 +7172,272 @@ mod tests {
             format!("sh -c {}", shlex::try_quote(&inner).unwrap())
         });
 
-        let must_catch_unix = [
-            ("exec_shell", json!({"command": "rm -rf ~ --help"})),
-            ("exec_shell", json!({"command": "rm -rf .git -h"})),
-            ("exec_shell", json!({"command": "rm -rf / --version"})),
-            ("exec_shell", json!({"command": "rmdir .git --help"})),
-            (
-                "exec_shell",
-                json!({"command": "echo cd sub; find . -delete"}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "echo cd sub; rm -rf ../project"}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "cd sub | true; rm -rf ../project"}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "cd sub & rm -rf ../project"}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "sh -c 'cd sub'; find . -delete"}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "sh -c 'cd .. && rm -rf project'"}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "false && cd sub; rm -rf ."}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "if false; then cd sub; fi; find . -delete"}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "find . -delete -name '*.tmp'"}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "find -H ~ -name '*.tmp' -delete"}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "find -H ~ -name '[!.]*' -delete"}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "find . -path 'sub/.git' -delete"}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "find . -name '*.tmp' -exec sh -c 'rm -rf ~' _ {} +"}),
-            ),
-            ("exec_shell", json!({"command": "rm -rf ~/.."})),
-            (
-                "exec_shell",
-                json!({"command": format!("rm -rf {home_parent_str}")}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": format!("rm -rf {home_parent_glob}")}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": format!("rm -rf {ws_parent_glob}")}),
-            ),
-            (
-                "apply_patch",
-                json!({"patch": "--- a/.git/HEAD\n+++ /dev/null\n@@ -1 +0,0 @@\n-ref: refs/heads/main\n"}),
-            ),
-            ("write_file", json!({"path": ".git/HEAD", "content": ""})),
-            (
-                "exec_shell",
-                json!({"command": "cd; find . -name '*.tmp' -delete"}),
-            ),
-            ("exec_shell", json!({"command": "ln -s ~ h && rm -rf h/"})),
-            (
-                "exec_shell",
-                json!({"command": "ln -s .. up && cd up && rm -rf project"}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "rm -rf alice", "cwd": home_parent_str}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "rm -rf alice", "working_dir": home_parent_str}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "rm -rf ..", "cwd": sub_str}),
-            ),
-            ("exec_shell", json!({"command": "sh", "stdin": "rm -rf ~"})),
-            ("exec_shell_interact", json!({"stdin": "rm -rf ~\n"})),
-            ("exec_shell_interact", json!({"stdin": "rm -rf .\n"})),
-        ];
+        #[cfg(unix)]
+        {
+            let must_catch_unix = [
+                ("exec_shell", json!({"command": "rm -rf ~ --help"})),
+                ("exec_shell", json!({"command": "rm -rf .git -h"})),
+                ("exec_shell", json!({"command": "rm -rf / --version"})),
+                ("exec_shell", json!({"command": "rmdir .git --help"})),
+                (
+                    "exec_shell",
+                    json!({"command": "echo cd sub; find . -delete"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "echo cd sub; rm -rf ../project"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "cd sub | true; rm -rf ../project"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "cd sub & rm -rf ../project"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "sh -c 'cd sub'; find . -delete"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "sh -c 'cd .. && rm -rf project'"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "false && cd sub; rm -rf ."}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "if false; then cd sub; fi; find . -delete"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "find . -delete -name '*.tmp'"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "find -H ~ -name '*.tmp' -delete"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "find -H ~ -name '[!.]*' -delete"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "find . -path 'sub/.git' -delete"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "find . -name '*.tmp' -exec sh -c 'rm -rf ~' _ {} +"}),
+                ),
+                ("exec_shell", json!({"command": "rm -rf ~/.."})),
+                (
+                    "exec_shell",
+                    json!({"command": format!("rm -rf {home_parent_str}")}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": format!("rm -rf {home_parent_glob}")}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": format!("rm -rf {ws_parent_glob}")}),
+                ),
+                (
+                    "apply_patch",
+                    json!({"patch": "--- a/.git/HEAD\n+++ /dev/null\n@@ -1 +0,0 @@\n-ref: refs/heads/main\n"}),
+                ),
+                ("write_file", json!({"path": ".git/HEAD", "content": ""})),
+                (
+                    "exec_shell",
+                    json!({"command": "cd; find . -name '*.tmp' -delete"}),
+                ),
+                ("exec_shell", json!({"command": "ln -s ~ h && rm -rf h/"})),
+                (
+                    "exec_shell",
+                    json!({"command": "ln -s .. up && cd up && rm -rf project"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "rm -rf alice", "cwd": home_parent_str}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "rm -rf alice", "working_dir": home_parent_str}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "rm -rf ..", "cwd": sub_str}),
+                ),
+                ("exec_shell", json!({"command": "sh", "stdin": "rm -rf ~"})),
+                ("exec_shell_interact", json!({"stdin": "rm -rf ~\n"})),
+                ("exec_shell_interact", json!({"stdin": "rm -rf .\n"})),
+            ];
 
-        for (tool, params) in must_catch_unix {
-            let got =
-                critical_path_delete_with_home(tool, &params, Some(&ws), Some(&fake_home), false);
-            assert!(
-                got.is_some(),
-                "expected critical path detection for {tool} {params}"
-            );
+            for (tool, params) in must_catch_unix {
+                let got = critical_path_delete_with_home(
+                    tool,
+                    &params,
+                    Some(&ws),
+                    Some(&fake_home),
+                    false,
+                );
+                assert!(
+                    got.is_some(),
+                    "expected critical path detection for {tool} {params}"
+                );
+            }
+
+            let must_allow_unix = [
+                ("exec_shell", json!({"command": "rm -rf build/*"})),
+                ("exec_shell", json!({"command": "rm -rf node_modules/*"})),
+                (
+                    "exec_shell",
+                    json!({"command": "find . -name '*.pyc' -delete"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "find . -type d -name __pycache__ -exec rm -rf {} +"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "git commit -m \"fix rm -rf / handling\""}),
+                ),
+                ("exec_shell", json!({"command": "rm --help"})),
+                (
+                    "exec_shell",
+                    json!({"command": "rm -rf build", "working_dir": sub_str}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "cat > notes.txt", "stdin": "don't forget\n"}),
+                ),
+                ("exec_shell_interact", json!({"stdin": "don't\n"})),
+                ("exec_shell", json!({"command": nested_non_delete})),
+                (
+                    "exec_shell",
+                    json!({"command": "case \"$x\" in a) echo hi ;; esac"}),
+                ),
+            ];
+
+            for (tool, params) in must_allow_unix {
+                let got = critical_path_delete_with_home(
+                    tool,
+                    &params,
+                    Some(&ws),
+                    Some(&fake_home),
+                    false,
+                );
+                assert_eq!(
+                    got, None,
+                    "unexpected critical path hit for {tool} {params}"
+                );
+            }
         }
 
-        let must_allow_unix = [
-            ("exec_shell", json!({"command": "rm -rf build/*"})),
-            ("exec_shell", json!({"command": "rm -rf node_modules/*"})),
-            (
-                "exec_shell",
-                json!({"command": "find . -name '*.pyc' -delete"}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "find . -type d -name __pycache__ -exec rm -rf {} +"}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "git commit -m \"fix rm -rf / handling\""}),
-            ),
-            ("exec_shell", json!({"command": "rm --help"})),
-            (
-                "exec_shell",
-                json!({"command": "rm -rf build", "working_dir": sub_str}),
-            ),
-            (
-                "exec_shell",
-                json!({"command": "cat > notes.txt", "stdin": "don't forget\n"}),
-            ),
-            ("exec_shell_interact", json!({"stdin": "don't\n"})),
-            ("exec_shell", json!({"command": nested_non_delete})),
-            (
-                "exec_shell",
-                json!({"command": "case \"$x\" in a) echo hi ;; esac"}),
-            ),
-        ];
+        #[cfg(windows)]
+        {
+            let must_catch_win = [
+                (
+                    "exec_shell",
+                    json!({"command": "echo cd sub; rm -rf ../project"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "cd sub | true; rm -rf ../project"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "cd sub & rm -rf ../project"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "sh -c 'cd .. && rm -rf project'"}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": format!("rm -rf {home_parent_str}")}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": format!("rm -rf {home_parent_glob}")}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": format!("rm -rf {ws_parent_glob}")}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "rm -rf alice", "cwd": home_parent_str}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "rm -rf alice", "working_dir": home_parent_str}),
+                ),
+                (
+                    "exec_shell",
+                    json!({"command": "rm -rf ..", "cwd": sub_str}),
+                ),
+            ];
 
-        for (tool, params) in must_allow_unix {
-            let got =
-                critical_path_delete_with_home(tool, &params, Some(&ws), Some(&fake_home), false);
-            assert_eq!(
-                got, None,
-                "unexpected critical path hit for {tool} {params}"
+            for (tool, params) in must_catch_win {
+                let got = critical_path_delete_with_home(
+                    tool,
+                    &params,
+                    Some(&ws),
+                    Some(&fake_home),
+                    true,
+                );
+                assert!(
+                    got.is_some(),
+                    "expected critical path detection for {tool} {params}"
+                );
+            }
+
+            let must_allow_win = [
+                ("exec_shell", json!({"command": "rm -rf build"})),
+                (
+                    "exec_shell",
+                    json!({"command": "rm -rf build", "working_dir": sub_str}),
+                ),
+                ("exec_shell", json!({"command": nested_non_delete})),
+                (
+                    "exec_shell",
+                    json!({"command": "cat > notes.txt", "stdin": "don't forget\n"}),
+                ),
+            ];
+
+            for (tool, params) in must_allow_win {
+                let got = critical_path_delete_with_home(
+                    tool,
+                    &params,
+                    Some(&ws),
+                    Some(&fake_home),
+                    true,
+                );
+                assert_eq!(
+                    got, None,
+                    "unexpected critical path hit for {tool} {params}"
+                );
+            }
+        }
+
+        let win_proj_ws = std::path::Path::new("C:\\Users\\alice\\work\\project");
+        let win_proj_home = std::path::Path::new("C:\\Users\\alice");
+        for cmd in [
+            "echo cd sub; rm -rf ../project",
+            "cd sub | true; rm -rf ../project",
+            "cd sub & rm -rf ../project",
+        ] {
+            let got = critical_path_delete_with_home(
+                "exec_shell",
+                &json!({"command": cmd}),
+                Some(win_proj_ws),
+                Some(win_proj_home),
+                true,
             );
+            assert_eq!(got, Some(CriticalPathKind::WorkspaceOrAncestor), "{cmd}");
         }
 
         let win_utf8_ws = std::path::Path::new("C:\\Users\\张三\\proj");
@@ -7289,5 +7506,127 @@ mod tests {
             present_plan,
             AutoReviewPlanDecision::ForcePrompt(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn windows_drive_unc_and_backslash_rm_targets_engage_unattended_destroyer_floor() {
+        let policy = AutoReviewPolicy::default();
+        let authority = crate::core::authority::TurnAuthority::from_effective_fields(
+            codewhale_config::AppMode::Agent,
+            false,
+            true,
+            false,
+            ApprovalMode::Auto,
+        )
+        .with_rust_origin(RunOrigin::Headless, false);
+
+        for command in [
+            r#"rm -rf "C:\Users\RUNNER~1\AppData\Local\Temp\outside""#,
+            r#"rm -rf C:\Users\alice\outside"#,
+            r#"rm -rf \Windows\System32"#,
+            r#"rm -rf \\server\share\outside"#,
+            r#"rm -rf 'C:\Users\alice\outside'"#,
+            r#"rm -rf C:outside"#,
+            r#"rm -rf \@outside"#,
+            r#"rm -rf \+outside"#,
+            r#"rm -rf \中文"#,
+            r#"rm -rf "\(outside)""#,
+            r#"rm -rf \(outside)"#,
+            r#"rm -rf \#outside"#,
+            r#"rm -rf \$Recycle.Bin"#,
+            r#"rm -rf "C:\outside\""#,
+        ] {
+            let params = json!({ "command": command });
+            assert!(
+                shell_params_are_destructive_like(&params, None),
+                "expected destroyer match for `{command}`"
+            );
+            let ctx = AutoReviewContext::from_turn_authority_async(
+                "exec_shell",
+                &params,
+                &authority,
+                false,
+                None,
+            )
+            .await
+            .expect("build auto review context");
+            assert_eq!(ctx.action_kind, ToolActionKind::Destructive, "{command}");
+            let decision = policy.evaluate(&ctx);
+            assert!(
+                decision.built_in_safety_gate,
+                "expected destroyer floor for `{command}`, got {decision:?}"
+            );
+            let expected_action = if ctx.critical_path_delete.is_some() {
+                AutoReviewAction::Block
+            } else {
+                AutoReviewAction::AskUser
+            };
+            assert_eq!(decision.action, expected_action, "{command}");
+        }
+
+        for command in [
+            r#"rm -rf "C:\Users\RUNNER~1\AppData\Local\Temp\outside""#,
+            r#"rm -rf C:\Users\alice\outside"#,
+            r#"rm -rf \Windows\System32"#,
+            r#"rm -rf \\server\share\outside"#,
+            r#"rm -rf 'C:\Users\alice\outside'"#,
+            r#"rm -rf C:outside"#,
+        ] {
+            let params = json!({ "command": command });
+            let ctx = AutoReviewContext::from_turn_authority_async(
+                "exec_shell",
+                &params,
+                &authority,
+                false,
+                None,
+            )
+            .await
+            .expect("build auto review context");
+            assert!(ctx.critical_path_delete.is_none(), "{command}");
+            let decision = policy.evaluate(&ctx);
+            assert!(decision.built_in_safety_gate, "{command}");
+            assert_eq!(decision.action, AutoReviewAction::AskUser, "{command}");
+        }
+
+        assert_eq!(
+            normalize_windows_separators_for_shlex(r#"echo "keep \" C:\outside""#),
+            r#"echo "keep \" C:/outside""#,
+        );
+        assert_eq!(
+            normalize_windows_separators_for_shlex(r#"echo "hello\\" "rm -rf C:\outside""#),
+            r#"echo "hello//" "rm -rf C:/outside""#,
+        );
+        assert_eq!(
+            normalize_windows_separators_for_shlex(r#"echo 'rm -rf C:\outside'"#),
+            r#"echo 'rm -rf C:\outside'"#,
+        );
+
+        for safe_command in [
+            r#"echo "hello\\" "rm -rf C:\outside""#,
+            r#"echo 'rm -rf C:\outside'"#,
+            r#"echo "rm -rf C:\outside""#,
+            r#"echo "keep \" text" "second""#,
+        ] {
+            let params = json!({ "command": safe_command });
+            assert!(
+                !shell_params_are_destructive_like(&params, None),
+                "expected quoted command `{safe_command}` not to match destroyer helper"
+            );
+            let ctx = AutoReviewContext::from_turn_authority_async(
+                "exec_shell",
+                &params,
+                &authority,
+                false,
+                None,
+            )
+            .await
+            .expect("build auto review context");
+            assert_eq!(ctx.action_kind, ToolActionKind::Shell, "{safe_command}");
+            let decision = policy.evaluate(&ctx);
+            assert!(
+                !decision.built_in_safety_gate,
+                "expected quoted command `{safe_command}` not to engage destroyer floor, got {decision:?}"
+            );
+        }
     }
 }
